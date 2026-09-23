@@ -1,0 +1,111 @@
+# Verification iOS SANS signature.
+#
+# Ce depot est public : les runners macOS standards y sont gratuits et sans
+# limite de minutes, contrairement a un depot prive ou ils consomment le
+# quota a 10x le taux Linux.
+#
+# Rien de sensible ne doit passer ici :
+#   - aucun certificat, aucun profil de provisioning, aucune cle API Apple
+#   - aucun IPA signe en artefact (il serait telechargeable par tout le monde)
+# La signature et l'envoi vers TestFlight se font sur Codemagic, a partir du
+# depot prive.
+#
+# Seul secret utilise : APP_REPO_TOKEN, un token a portee lecture sur le
+# depot prive, necessaire pour cloner le submodule. Un workflow declenche
+# par une pull request depuis un fork n'y a pas acces (garanti par GitHub).
+name: Verification iOS
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Tous les jours a 6h UTC : detecte une regression sans avoir a y penser.
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Le submodule pointe vers un depot prive : le token par defaut du
+      # job ne suffit pas, il n'a de droits que sur ce depot-ci.
+      - name: Recuperer le code source (submodule prive)
+        env:
+          APP_REPO_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${APP_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+          git submodule update --init --depth 1 app
+          git config --global --unset url."https://x-access-token:${APP_REPO_TOKEN}@github.com/".insteadOf
+
+      # Suit la branche dev du depot prive plutot que le commit fige dans
+      # .gitmodules, qui serait vite perime.
+      - name: Se placer sur le dernier dev
+        working-directory: app
+        run: |
+          git fetch --depth 1 origin dev
+          git checkout FETCH_HEAD
+          echo "Commit verifie : $(git rev-parse --short HEAD)"
+          git log -1 --format='%s'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.41.5'
+          channel: stable
+          cache: true
+
+      - name: Cache paquets Dart
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('app/pubspec.lock') }}
+          restore-keys: pub-${{ runner.os }}-
+
+      - name: Dependances Flutter
+        working-directory: app
+        run: flutter pub get
+
+      - name: Analyse statique
+        working-directory: app
+        run: flutter analyze
+
+      - name: Tests
+        working-directory: app
+        run: flutter test
+
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: |
+            app/ios/Pods
+            ~/Library/Caches/CocoaPods
+          key: pods-${{ runner.os }}-${{ hashFiles('app/ios/Podfile.lock') }}
+          restore-keys: pods-${{ runner.os }}-
+
+      - name: Dependances iOS (CocoaPods)
+        working-directory: app/ios
+        run: |
+          if [ -f Podfile.lock ]; then
+            pod install || pod install --repo-update
+          else
+            pod install --repo-update
+          fi
+
+      - name: Compilation iOS sans signature
+        working-directory: app
+        run: flutter build ios --release --no-codesign
+
+      # Podfile.lock n'est pas encore dans le depot et ne peut pas etre
+      # genere sous Windows. Recuperable ici pour etre commite, ce qui
+      # rendra le cache CocoaPods reellement efficace.
+      - name: Exposer le Podfile.lock
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Podfile-lock
+          path: app/ios/Podfile.lock
+          retention-days: 5
