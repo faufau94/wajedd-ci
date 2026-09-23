@@ -15,10 +15,24 @@
 # par une pull request depuis un fork n'y a pas acces (garanti par GitHub).
 name: Verification iOS
 
+# Affiche le message du commit verifie dans la liste des runs, plutot
+# qu'un "Verification iOS" repete a l'identique.
+run-name: >-
+  Verification iOS
+  ${{ github.event.client_payload.message && format('— {0}', github.event.client_payload.message) || '' }}
+
 on:
   workflow_dispatch:
+  # Declenche par le CI GitLab a chaque push sur dev, une fois les tests
+  # Dart passes. Ce depot ne recoit aucun push : le code arrive par le
+  # miroir GitLab -> GitHub prive, auquel le submodule fait reference.
+  repository_dispatch:
+    types: [verify-ios]
   schedule:
-    # Tous les jours a 6h UTC : detecte une regression sans avoir a y penser.
+    # Filet secondaire : detecte une regression venue d'une dependance
+    # externe, sans nouveau commit de notre cote.
+    # GitHub desactive un cron apres plusieurs echecs consecutifs, ou
+    # apres 60 jours sans activite sur le depot.
     - cron: '0 6 * * *'
 
 permissions:
@@ -33,21 +47,49 @@ jobs:
       - uses: actions/checkout@v4
 
       # Le submodule pointe vers un depot prive : le token par defaut du
-      # job ne suffit pas, il n'a de droits que sur ce depot-ci.
+      # job n'a de droits que sur ce depot-ci.
+      #
+      # On ne se fie pas au commit fige dans .gitmodules, vite perime. Deux
+      # cas :
+      #   - declenchement par le CI GitLab : on verifie exactement le commit
+      #     qui l'a declenche. Le miroir GitLab -> GitHub pouvant avoir
+      #     quelques minutes de retard, on attend qu'il arrive plutot que de
+      #     verifier un etat anterieur en le faisant passer pour le bon.
+      #   - declenchement manuel ou planifie : on prend la tete de dev.
       - name: Recuperer le code source (submodule prive)
         env:
           APP_REPO_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
+          TARGET_SHA: ${{ github.event.client_payload.sha }}
         run: |
           git config --global url."https://x-access-token:${APP_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
-          git submodule update --init --depth 1 app
-          git config --global --unset url."https://x-access-token:${APP_REPO_TOKEN}@github.com/".insteadOf
 
-      # Suit la branche dev du depot prive plutot que le commit fige dans
-      # .gitmodules, qui serait vite perime.
-      - name: Se placer sur le dernier dev
-        working-directory: app
-        run: |
-          git fetch --depth 1 origin dev
+          cleanup() {
+            git config --global --unset url."https://x-access-token:${APP_REPO_TOKEN}@github.com/".insteadOf || true
+          }
+          trap cleanup EXIT
+
+          git submodule update --init --depth 1 app
+          cd app
+
+          if [ -n "$TARGET_SHA" ]; then
+            fetched=""
+            for attempt in 1 2 3 4 5 6; do
+              if git fetch --depth 1 origin "$TARGET_SHA" 2>/dev/null; then
+                fetched="yes"
+                break
+              fi
+              echo "Commit $TARGET_SHA pas encore miroite (tentative $attempt/6), nouvelle tentative dans 30 s."
+              sleep 30
+            done
+
+            if [ -z "$fetched" ]; then
+              echo "::error::Le commit $TARGET_SHA n'est pas arrive sur le miroir GitHub apres 3 minutes."
+              exit 1
+            fi
+          else
+            git fetch --depth 1 origin dev
+          fi
+
           git checkout FETCH_HEAD
           echo "Commit verifie : $(git rev-parse --short HEAD)"
           git log -1 --format='%s'
